@@ -1099,10 +1099,267 @@ static struct binder_ref *binder_get_ref_for_node(struct binder_proc *proc,
 	new_ref->desc = (node == context->binder_context_mgr_node) ? 0 : 1;
 	for (n = rb_first(&proc->refs_by_desc); n != NULL; n = rb_next(n)) {
 		ref = rb_entry(n, struct binder_ref, rb_node_desc);
-		if (ref->desc > new_ref->desc)
+		if (ref->data.desc > new_ref->data.desc)
 			break;
-		new_ref->desc = ref->desc + 1;
+		new_ref->data.desc = ref->data.desc + 1;
 	}
+
+	p = &proc->refs_by_desc.rb_node;
+	while (*p) {
+		parent = *p;
+		ref = rb_entry(parent, struct binder_ref, rb_node_desc);
+
+		if (new_ref->data.desc < ref->data.desc)
+			p = &(*p)->rb_left;
+		else if (new_ref->data.desc > ref->data.desc)
+			p = &(*p)->rb_right;
+		else
+			BUG();
+	}
+	rb_link_node(&new_ref->rb_node_desc, parent, p);
+	rb_insert_color(&new_ref->rb_node_desc, &proc->refs_by_desc);
+
+	binder_node_lock(node);
+	hlist_add_head(&new_ref->node_entry, &node->refs);
+
+	binder_debug(BINDER_DEBUG_INTERNAL_REFS,
+		     "%d new ref %d desc %d for node %d\n",
+		      proc->pid, new_ref->data.debug_id, new_ref->data.desc,
+		      node->debug_id);
+	binder_node_unlock(node);
+	return new_ref;
+}
+
+static void binder_cleanup_ref_olocked(struct binder_ref *ref)
+{
+	bool delete_node = false;
+
+	binder_debug(BINDER_DEBUG_INTERNAL_REFS,
+		     "%d delete ref %d desc %d for node %d\n",
+		      ref->proc->pid, ref->data.debug_id, ref->data.desc,
+		      ref->node->debug_id);
+
+	rb_erase(&ref->rb_node_desc, &ref->proc->refs_by_desc);
+	rb_erase(&ref->rb_node_node, &ref->proc->refs_by_node);
+
+	binder_node_inner_lock(ref->node);
+	if (ref->data.strong)
+		binder_dec_node_nilocked(ref->node, 1, 1);
+
+	hlist_del(&ref->node_entry);
+	delete_node = binder_dec_node_nilocked(ref->node, 0, 1);
+	binder_node_inner_unlock(ref->node);
+	/*
+	 * Clear ref->node unless we want the caller to free the node
+	 */
+	if (!delete_node) {
+		/*
+		 * The caller uses ref->node to determine
+		 * whether the node needs to be freed. Clear
+		 * it since the node is still alive.
+		 */
+		ref->node = NULL;
+	}
+
+	if (ref->death) {
+		binder_debug(BINDER_DEBUG_DEAD_BINDER,
+			     "%d delete ref %d desc %d has death notification\n",
+			      ref->proc->pid, ref->data.debug_id,
+			      ref->data.desc);
+		binder_dequeue_work(ref->proc, &ref->death->work);
+		binder_stats_deleted(BINDER_STAT_DEATH);
+	}
+	binder_stats_deleted(BINDER_STAT_REF);
+}
+
+/**
+ * binder_inc_ref_olocked() - increment the ref for given handle
+ * @ref:         ref to be incremented
+ * @strong:      if true, strong increment, else weak
+ * @target_list: list to queue node work on
+ *
+ * Increment the ref. @ref->proc->outer_lock must be held on entry
+ *
+ * Return: 0, if successful, else errno
+ */
+static int binder_inc_ref_olocked(struct binder_ref *ref, int strong,
+				  struct list_head *target_list)
+{
+	int ret;
+
+	if (strong) {
+		if (ref->data.strong == 0) {
+			ret = binder_inc_node(ref->node, 1, 1, target_list);
+			if (ret)
+				return ret;
+		}
+		ref->data.strong++;
+	} else {
+		if (ref->data.weak == 0) {
+			ret = binder_inc_node(ref->node, 0, 1, target_list);
+			if (ret)
+				return ret;
+		}
+		ref->data.weak++;
+	}
+	return 0;
+}
+
+/**
+ * binder_dec_ref() - dec the ref for given handle
+ * @ref:	ref to be decremented
+ * @strong:	if true, strong decrement, else weak
+ *
+ * Decrement the ref.
+ *
+ * Return: true if ref is cleaned up and ready to be freed
+ */
+static bool binder_dec_ref_olocked(struct binder_ref *ref, int strong)
+{
+	if (strong) {
+		if (ref->data.strong == 0) {
+			binder_user_error("%d invalid dec strong, ref %d desc %d s %d w %d\n",
+					  ref->proc->pid, ref->data.debug_id,
+					  ref->data.desc, ref->data.strong,
+					  ref->data.weak);
+			return false;
+		}
+		ref->data.strong--;
+		if (ref->data.strong == 0)
+			binder_dec_node(ref->node, strong, 1);
+	} else {
+		if (ref->data.weak == 0) {
+			binder_user_error("%d invalid dec weak, ref %d desc %d s %d w %d\n",
+					  ref->proc->pid, ref->data.debug_id,
+					  ref->data.desc, ref->data.strong,
+					  ref->data.weak);
+			return false;
+		}
+		ref->data.weak--;
+	}
+	if (ref->data.strong == 0 && ref->data.weak == 0) {
+		binder_cleanup_ref_olocked(ref);
+		return true;
+	}
+	return false;
+}
+
+/**
+ * binder_get_node_from_ref() - get the node from the given proc/desc
+ * @proc:	proc containing the ref
+ * @desc:	the handle associated with the ref
+ * @need_strong_ref: if true, only return node if ref is strong
+ * @rdata:	the id/refcount data for the ref
+ *
+ * Given a proc and ref handle, return the associated binder_node
+ *
+ * Return: a binder_node or NULL if not found or not strong when strong required
+ */
+static struct binder_node *binder_get_node_from_ref(
+		struct binder_proc *proc,
+		u32 desc, bool need_strong_ref,
+		struct binder_ref_data *rdata)
+{
+	struct binder_node *node;
+	struct binder_ref *ref;
+
+	binder_proc_lock(proc);
+	ref = binder_get_ref_olocked(proc, desc, need_strong_ref);
+	if (!ref)
+		goto err_no_ref;
+	node = ref->node;
+	/*
+	 * Take an implicit reference on the node to ensure
+	 * it stays alive until the call to binder_put_node()
+	 */
+	binder_inc_node_tmpref(node);
+	if (rdata)
+		*rdata = ref->data;
+	binder_proc_unlock(proc);
+
+	return node;
+
+err_no_ref:
+	binder_proc_unlock(proc);
+	return NULL;
+}
+
+/**
+ * binder_free_ref() - free the binder_ref
+ * @ref:	ref to free
+ *
+ * Free the binder_ref. Free the binder_node indicated by ref->node
+ * (if non-NULL) and the binder_ref_death indicated by ref->death.
+ */
+static void binder_free_ref(struct binder_ref *ref)
+{
+	if (ref->node)
+		binder_free_node(ref->node);
+	kfree(ref->death);
+	kfree(ref);
+}
+
+/**
+ * binder_update_ref_for_handle() - inc/dec the ref for given handle
+ * @proc:	proc containing the ref
+ * @desc:	the handle associated with the ref
+ * @increment:	true=inc reference, false=dec reference
+ * @strong:	true=strong reference, false=weak reference
+ * @rdata:	the id/refcount data for the ref
+ *
+ * Given a proc and ref handle, increment or decrement the ref
+ * according to "increment" arg.
+ *
+ * Return: 0 if successful, else errno
+ */
+static int binder_update_ref_for_handle(struct binder_proc *proc,
+		uint32_t desc, bool increment, bool strong,
+		struct binder_ref_data *rdata)
+{
+	int ret = 0;
+	struct binder_ref *ref;
+	bool delete_ref = false;
+
+	binder_proc_lock(proc);
+	ref = binder_get_ref_olocked(proc, desc, strong);
+	if (!ref) {
+		ret = -EINVAL;
+		goto err_no_ref;
+	}
+	if (increment)
+		ret = binder_inc_ref_olocked(ref, strong, NULL);
+	else
+		delete_ref = binder_dec_ref_olocked(ref, strong);
+
+	if (rdata)
+		*rdata = ref->data;
+	binder_proc_unlock(proc);
+
+	if (delete_ref)
+		binder_free_ref(ref);
+	return ret;
+
+err_no_ref:
+	binder_proc_unlock(proc);
+	return ret;
+}
+
+/**
+ * binder_dec_ref_for_handle() - dec the ref for given handle
+ * @proc:	proc containing the ref
+ * @desc:	the handle associated with the ref
+ * @strong:	true=strong reference, false=weak reference
+ * @rdata:	the id/refcount data for the ref
+ *
+ * Just calls binder_update_ref_for_handle() to decrement the ref.
+ *
+ * Return: 0 if successful, else errno
+ */
+static int binder_dec_ref_for_handle(struct binder_proc *proc,
+		uint32_t desc, bool strong, struct binder_ref_data *rdata)
+{
+	return binder_update_ref_for_handle(proc, desc, false, strong, rdata);
+}
 
 	p = &proc->refs_by_desc.rb_node;
 	while (*p) {
@@ -1130,7 +1387,16 @@ static struct binder_ref *binder_get_ref_for_node(struct binder_proc *proc,
 			     "%d new ref %d desc %d for dead node\n",
 			      proc->pid, new_ref->debug_id, new_ref->desc);
 	}
-	return new_ref;
+	ret = binder_inc_ref_olocked(ref, strong, target_list);
+	*rdata = ref->data;
+	binder_proc_unlock(proc);
+	if (new_ref && ref != new_ref)
+		/*
+		 * Another thread created the ref first so
+		 * free the one we allocated
+		 */
+		kfree(new_ref);
+	return ret;
 }
 
 static void binder_delete_ref(struct binder_ref *ref)
@@ -1496,9 +1762,8 @@ static void binder_transaction_buffer_release(struct binder_proc *proc,
 				break;
 			}
 			binder_debug(BINDER_DEBUG_TRANSACTION,
-				     "        ref %d desc %d (node %d)\n",
-				     ref->debug_id, ref->desc, ref->node->debug_id);
-			binder_dec_ref(&ref, hdr->type == BINDER_TYPE_HANDLE);
+				     "        ref %d desc %d\n",
+				     rdata.debug_id, rdata.desc);
 		} break;
 
 		case BINDER_TYPE_FD: {
@@ -1552,8 +1817,7 @@ static void binder_transaction_buffer_release(struct binder_proc *proc,
 				       debug_id, (u64)fda->num_fds);
 				continue;
 			}
-			fd_array = (u32 *)(uintptr_t)
-				(parent_buffer + fda->parent_offset);
+			fd_array = (u32 *)(parent_buffer + fda->parent_offset);
 			for (fd_index = 0; fd_index < fda->num_fds; fd_index++)
 				task_close_fd(proc, fd_array[fd_index]);
 		} break;
@@ -1823,8 +2087,9 @@ static int binder_fixup_parent(struct binder_transaction *t,
 				  proc->pid, thread->pid);
 		return -EINVAL;
 	}
-	parent_buffer = (u8 *)(uintptr_t)(parent->buffer -
-			       target_proc->user_buffer_offset);
+	parent_buffer = (u8 *)(parent->buffer -
+			binder_alloc_get_user_buffer_offset(
+				&target_proc->alloc));
 	*(binder_uintptr_t *)(parent_buffer + bp->parent_offset) = bp->buffer;
 
 	return 0;
@@ -2337,26 +2602,24 @@ static int binder_thread_write(struct binder_proc *proc,
 				break;
 			case BC_RELEASE:
 				debug_string = "Release";
-				binder_dec_ref(&ref, 1);
 				break;
 			case BC_DECREFS:
 			default:
 				debug_string = "DecRefs";
-				binder_dec_ref(&ref, 0);
 				break;
 			}
-		  if (ref == NULL) {
+			if (ret) {
+				binder_user_error("%d:%d %s %d refcount change on invalid ref %d ret %d\n",
+					proc->pid, thread->pid, debug_string,
+					strong, target, ret);
+				break;
+			}
 			binder_debug(BINDER_DEBUG_USER_REFS,
-			  "binder: %d:%d %s ref deleted",
-			  proc->pid, thread->pid, debug_string);
-		  } else {
-			binder_debug(BINDER_DEBUG_USER_REFS,
-			  "binder: %d:%d %s ref %d desc %d s %d w %d for node %d\n",
-			  proc->pid, thread->pid, debug_string,
-			  ref->debug_id, ref->desc, ref->strong,
-			  ref->weak, ref->node->debug_id);
-		  }
-		  break;
+				     "%d:%d %s ref %d desc %d s %d w %d\n",
+				     proc->pid, thread->pid, debug_string,
+				     rdata.debug_id, rdata.desc, rdata.strong,
+				     rdata.weak);
+			break;
 		}
 		case BC_INCREFS_DONE:
 		case BC_ACQUIRE_DONE: {
