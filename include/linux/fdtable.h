@@ -75,11 +75,19 @@ struct dentry;
 
 extern void __init files_defer_init(void);
 
+#define rcu_dereference_check_fdtable(files, fdtfd) \
+	rcu_dereference_check((fdtfd), lockdep_is_held(&(files)->file_lock))
+
+#define files_fdtable(files) \
+	rcu_dereference_check_fdtable((files), (files)->fdt)
+
+/*
+ * The caller must ensure that fd table isn't shared or hold rcu or file lock
+ */
 static inline struct file * fcheck_files(struct files_struct *files, unsigned int fd)
 {
-	struct file * file = NULL;
-	struct fdtable *fdt = files_fdtable(files);
-
+       	struct file * file = NULL;
+	struct fdtable *fdt = rcu_dereference_raw(files->fdt);
 	if (fd < fdt->max_fds) {
 		fd = array_index_nospec(fd, fdt->max_fds);
 		file = rcu_dereference_check_fdtable(files, fdt->fd[fd]);
